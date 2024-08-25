@@ -1,0 +1,120 @@
+trigger: none
+
+pool:
+  vmImage: "windows-latest"
+
+parameters:
+- name: environment
+  type: object
+  default: ['d','p']    
+- name: refreshDataset
+  type: boolean
+  default: false
+
+variables:
+- name: environmentList
+  ${{ if eq(variables['Build.Reason'],'PullRequest') }}:
+    value: p
+  ${{ else }}:
+    value: ${{ join(',',parameters.environment) }}
+
+stages:
+  - ${{ each environmentItem in split(variables.environmentList, ',')}}:
+      - stage: Deploy_${{environmentItem}}
+        displayName: Stage Deploy ${{environmentItem}}
+        variables:
+          - template: ./variables/variables.yml
+          - template: ./variables/variables-${{environmentItem}}.yml
+  
+        jobs:
+        - deployment: Deploy
+          displayName: Deploy to ${{environmentItem}}   
+          environment: ${{variables.azdoEnvironment}}
+          strategy:
+            runOnce:
+              deploy:
+                steps:
+                  - checkout: none
+  
+                  - task: AzureKeyVault@1
+                    condition: eq('${{environmentItem}}','d')
+                    inputs:
+                      azureSubscription: ${{variables.azdoServiceConnection}}
+                      KeyVaultName: ${{variables.azKeyVaultName}}
+                      SecretsFilter: 'scrt-entraid-automationuseraccount-password'
+
+                  - task: AzurePowerShell@5
+                    condition: eq('${{environmentItem}}','d')
+                    displayName: 'GitIntegration-UpdateFromGit.ps1'
+                    inputs:
+                      azureSubscription: ${{variables.azdoServiceConnection}}
+                      ScriptType: 'InlineScript'
+                      Inline: |
+                          try {
+                              $username = "${{variables.azAADAutomationUserAccount}}"
+                              $password = ConvertTo-SecureString $(scrt-entraid-automationuseraccount-password) -AsPlainText -Force
+                              $psCred = New-Object System.Management.Automation.PSCredential($username, $password)
+                              Write-Host "Calling Connect-AzAccount to use our Automation Account"
+                              Connect-AzAccount -Credential $psCred -Tenant ${{variables.azTenantId}} | Out-Null
+                              $global:resourceUrl = "https://api.fabric.microsoft.com"
+                              $fabricToken = (Get-AzAccessToken -ResourceUrl $global:resourceUrl).Token
+                              $global:fabricHeaders = @{
+                                  'Content-Type' = "application/json"
+                                  'Authorization' = "Bearer {0}" -f $fabricToken
+                              }
+                              Write-Host "Calling GET workspaces REST API to confirm the existance of the workspace."
+                              $global:baseUrl = $global:resourceUrl + "/v1" 
+                              $getWorkspacesUrl = "{0}/workspaces" -f $global:baseUrl
+                              $workspaces = (Invoke-RestMethod -Headers $global:fabricHeaders -Uri $getWorkspacesUrl -Method GET).value
+                              # Try to find the workspace by display name
+                              $workspace = $workspaces | Where-Object {$_.DisplayName -eq '${{variables.pbiWorkspaceName}}'}
+                              if ($workspace -ne $null) {
+                                  $gitStatusUrl = "{0}/workspaces/{1}/git/status" -f $global:baseUrl, $workspace.Id
+                                  Write-Host "Calling GET Status REST API to construct the request body for UpdateFromGit REST API."
+                                  $gitStatusResponse = Invoke-RestMethod -Headers $global:fabricHeaders -Uri $gitStatusUrl -Method GET
+                                  # Update from Git
+                                  Write-Host "Calling GET updateFromGit REST API to update the workspace '${{variables.pbiWorkspaceName}}' from Git"
+                                  $updateFromGitUrl = "{0}/workspaces/{1}/git/updateFromGit" -f $global:baseUrl, $workspace.Id
+                                  $updateFromGitBody = @{ 
+                                      remoteCommitHash = $gitStatusResponse.RemoteCommitHash
+                                      workspaceHead = $gitStatusResponse.WorkspaceHead
+                                      options = @{
+                                          # Allows overwriting existing items if needed
+                                          allowOverrideItems = $TRUE
+                                      }
+                                  } | ConvertTo-Json
+                                  $updateFromGitResponse = Invoke-WebRequest -Headers $global:fabricHeaders -Uri $updateFromGitUrl -Method POST -Body $updateFromGitBody
+                                  Write-Host "Update completed successfully"
+                              }
+                            } catch {
+                                Write-Host "Failed to update the workspace '${{variables.pbiWorkspaceName}}' from Git:$_"  
+                            }
+                      azurePowerShellVersion: 'LatestVersion'
+                    continueOnError: false
+
+                  - task: DeploymentPipelines-Deploy@1
+                    condition: ne('${{environmentItem}}','d')
+                    displayName: 'DeploymentPipelines-Deploy'
+                    inputs:
+                      deployType: All
+                      pbiConnection: ${{variables.pbiAutomationServiceConnection}}
+                      pipeline: ${{variables.pbiPipelineName}}
+                      stageOrder: ${{variables.pbiAutomationStageOrder}}
+                      waitForCompletion: true 
+                      createNewWS: false 
+                      allowCreateArtifact: true 
+                      allowOverwriteArtifact: true 
+                      updateApp: false #No apps included in this demo
+                      allowOverwriteTargetArtifactLabel: true 
+                      allowPurgeData: true 
+                      allowSkipTilesWithMissingPrerequisites: true
+                      allowTakeOver: false
+
+                  - task: PowerBIActions@5
+                    condition: eq('${{parameters.refreshDataset}}',true)
+                    displayName: "DataRefresh"
+                    inputs:
+                      PowerBIServiceEndpoint: ${{variables.pbiActionsServiceConnection}}
+                      Action: 'DataRefresh'
+                      WorkspaceName: ${{variables.pbiWorkspaceName}}
+                      DatasetName: ${{ variables.pbiReportDatasetName }}
